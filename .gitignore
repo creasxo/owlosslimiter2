@@ -1,0 +1,9 @@
+.DS_Store
+build/
+*.o
+*.exe
+LossLimiter.exe.manifest
+config.txt
+LossLimiter.log
+LossLimiter.log.old
+debug_crops/
