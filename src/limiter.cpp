@@ -1,23 +1,18 @@
 #include "limiter.h"
+#include "loss_tracker.h"
 #include "process_utils.h"
 #include "screen_capture.h"
 #include "ocr.h"
 #include "logging.h"
 #include "strutil.h"
 #include <windows.h>
-#include <deque>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <algorithm>
+#include <ctime>
 
 namespace {
-    constexpr double RESULT_HOLD_SECONDS = 4.0;
-    constexpr double RANK_HOLD_SECONDS   = 3.0;
-    constexpr size_t DEBOUNCE_COUNT      = 2;
     constexpr double ERROR_LOG_THROTTLE_SECONDS = 30.0;
-
-    enum class GameState { InGame, ResultScreen, RankScreen };
 
     const char* DetectionName(Detection d) {
         switch (d) {
@@ -32,9 +27,29 @@ namespace {
         GetModuleFileNameW(nullptr, buf, MAX_PATH);
         return std::filesystem::path(buf).parent_path();
     }
+
+    double NowSeconds() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void SaveDebugCrop(const CapturedImage& img, Detection detection) {
+        auto dir = AppDir() / "debug_crops";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::time_t t = std::time(nullptr);
+        std::tm tmBuf;
+        localtime_s(&tmBuf, &t);
+        char ts[32];
+        std::strftime(ts, sizeof(ts), "%H%M%S", &tmBuf);
+        std::string filename = std::string(ts) + "_" + DetectionName(detection) + ".png";
+        auto bytes = EncodePng(img);
+        std::ofstream out(dir / filename, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
 }
 
-Limiter::Limiter(Config cfg) : cfg_(std::move(cfg)) {}
+Limiter::Limiter(Config cfg, std::function<void()> onFinished)
+    : cfg_(std::move(cfg)), onFinished_(std::move(onFinished)) {}
 
 Limiter::~Limiter() {
     Stop();
@@ -42,6 +57,7 @@ Limiter::~Limiter() {
 
 void Limiter::Start() {
     if (running_.load()) return;
+    if (thread_.joinable()) thread_.join();
     stopRequested_ = false;
     running_ = true;
     thread_ = std::thread(&Limiter::Run, this);
@@ -67,12 +83,8 @@ bool Limiter::InterruptibleWait(double seconds) {
 void Limiter::Run() {
     auto& log = Logger::Instance();
     std::wstring tesseractExe = ResolveTesseractPath(cfg_);
-
-    int losses = 0;
-    GameState state = GameState::InGame;
-    bool pendingLoss = false;
-    std::deque<Detection> debounceBuf;
-    auto enteredAt = std::chrono::steady_clock::now();
+    LossTracker tracker(cfg_.losses);
+    bool gameWasRunning = true;
 
     auto lastCaptureErrorLog = std::chrono::steady_clock::now() - std::chrono::seconds(3600);
     auto lastOcrErrorLog     = lastCaptureErrorLog;
@@ -88,10 +100,13 @@ void Limiter::Run() {
 
         DWORD pid = FindProcessId(cfg_.process);
         if (pid == 0) {
-            log.Info("Overwatch not running - waiting...");
+            if (gameWasRunning) log.Info(cfg_.process + " not running - waiting...");
+            gameWasRunning = false;
             if (InterruptibleWait(5.0)) break;
             continue;
         }
+        if (!gameWasRunning) log.Info(cfg_.process + " found (pid " + std::to_string(pid) + ").");
+        gameWasRunning = true;
 
         CapturedImage img;
         std::string error;
@@ -116,64 +131,31 @@ void Limiter::Run() {
             }
         }
 
-        if (cfg_.debug && captured) {
-            auto dir = AppDir() / "debug_crops";
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            auto now = std::chrono::system_clock::now();
-            std::time_t t = std::chrono::system_clock::to_time_t(now);
-            std::tm tmBuf;
-            localtime_s(&tmBuf, &t);
-            char ts[32];
-            std::strftime(ts, sizeof(ts), "%H%M%S", &tmBuf);
-            std::string filename = std::string(ts) + "_" + DetectionName(detection) + ".png";
-            auto bytes = EncodePng(img);
-            std::ofstream out((dir / filename).string(), std::ios::binary);
-            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (cfg_.debug && captured) SaveDebugCrop(img, detection);
+
+        bool wasIdle = tracker.Idle();
+        int lossesBefore = tracker.Losses();
+        auto event = tracker.Update(detection, NowSeconds());
+        if (wasIdle && !tracker.Idle()) {
+            log.Info(std::string(DetectionName(detection)) + " detected");
         }
 
-        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - enteredAt).count();
-
-        if (state == GameState::InGame) {
-            debounceBuf.push_back(detection);
-            if (debounceBuf.size() > DEBOUNCE_COUNT) debounceBuf.pop_front();
-
-            bool allSame = debounceBuf.size() == DEBOUNCE_COUNT &&
-                            std::all_of(debounceBuf.begin(), debounceBuf.end(),
-                                        [&](Detection d) { return d == debounceBuf.front(); });
-            Detection first = debounceBuf.empty() ? Detection::None : debounceBuf.front();
-
-            if (allSame && (first == Detection::Defeat || first == Detection::Victory)) {
-                pendingLoss = (first == Detection::Defeat);
-                state = GameState::ResultScreen;
-                enteredAt = std::chrono::steady_clock::now();
-                debounceBuf.clear();
-                log.Info(std::string(pendingLoss ? "DEFEAT" : "VICTORY") + " detected");
-            }
-        } else if (state == GameState::ResultScreen) {
-            if (elapsed >= RESULT_HOLD_SECONDS) {
-                if (pendingLoss) {
-                    losses++;
-                    log.Info("Loss streak: " + std::to_string(losses) + "/" + std::to_string(cfg_.losses));
-                    if (losses >= cfg_.losses) {
-                        log.Info("Loss limit reached - closing Overwatch.");
-                        KillProcess(pid, [&](const std::string& m) { log.Info(m); });
-                        return;
-                    }
-                } else {
-                    log.Info("Win - streak reset (was " + std::to_string(losses) + ")");
-                    losses = 0;
-                }
-                state = GameState::RankScreen;
-                enteredAt = std::chrono::steady_clock::now();
-            }
-        } else if (state == GameState::RankScreen) {
-            if (elapsed >= RANK_HOLD_SECONDS) {
-                state = GameState::InGame;
-                enteredAt = std::chrono::steady_clock::now();
-                debounceBuf.clear();
-                log.Info("Back in game.");
-            }
+        switch (event) {
+        case LossTracker::Event::Win:
+            log.Info("Win - streak reset (was " + std::to_string(lossesBefore) + ")");
+            break;
+        case LossTracker::Event::Loss:
+            log.Info("Loss streak: " + std::to_string(tracker.Losses()) + "/" + std::to_string(cfg_.losses));
+            break;
+        case LossTracker::Event::LimitReached:
+            log.Info("Loss streak: " + std::to_string(tracker.Losses()) + "/" + std::to_string(cfg_.losses));
+            log.Info("Loss limit reached - closing " + cfg_.process + ".");
+            KillProcess(pid, [&](const std::string& m) { log.Info(m); });
+            running_ = false;
+            if (onFinished_) onFinished_();
+            return;
+        case LossTracker::Event::None:
+            break;
         }
 
         if (InterruptibleWait(cfg_.poll)) break;

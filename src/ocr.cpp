@@ -44,7 +44,7 @@ Detection RunOcr(const CapturedImage& img, const std::wstring& tesseractExe, std
     si.wShowWindow = SW_HIDE;
     si.hStdInput  = stdinPipe.rd;
     si.hStdOutput = stdoutPipe.wr;
-    si.hStdError  = hNul;
+    si.hStdError  = hNul != INVALID_HANDLE_VALUE ? hNul : nullptr;
 
     std::wstring cmd = L"\"" + tesseractExe + L"\" - stdout --psm 6";
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
@@ -56,7 +56,7 @@ Detection RunOcr(const CapturedImage& img, const std::wstring& tesseractExe, std
 
     CloseHandle(stdinPipe.rd);
     CloseHandle(stdoutPipe.wr);
-    if (hNul) CloseHandle(hNul);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
 
     if (!ok) {
         error = "Failed to launch tesseract (is the path correct? see Settings).";

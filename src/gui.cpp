@@ -14,6 +14,7 @@
 namespace {
 
 constexpr UINT WM_APP_LOG = WM_APP + 1;
+constexpr UINT WM_APP_LIMITER_FINISHED = WM_APP + 2;
 constexpr UINT_PTR TIMER_STATUS_CLEAR = 1;
 
 enum ControlId {
@@ -37,6 +38,8 @@ struct AppState {
     HWND hStatusLabel = nullptr;
     HWND hLogView = nullptr;
     HFONT hFont = nullptr;
+    HFONT hTitleFont = nullptr;
+    UINT dpi = 96;
 
     Config cfg;
     std::unique_ptr<Limiter> limiter;
@@ -45,6 +48,11 @@ struct AppState {
 };
 
 AppState g_app;
+
+// Layout is written in 96-DPI pixels and scaled to the monitor's DPI.
+int Px(int v) {
+    return MulDiv(v, static_cast<int>(g_app.dpi), 96);
+}
 
 std::wstring AppDirW() {
     wchar_t buf[MAX_PATH];
@@ -61,21 +69,21 @@ std::wstring GetText(HWND h) {
 
 void SetLabel(HWND parent, HFONT font, const wchar_t* text, int x, int y, int w, int h) {
     HWND lbl = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
-                                x, y, w, h, parent, nullptr, nullptr, nullptr);
+                                Px(x), Px(y), Px(w), Px(h), parent, nullptr, nullptr, nullptr);
     SendMessageW(lbl, WM_SETFONT, (WPARAM)font, TRUE);
 }
 
 HWND MakeEdit(HWND parent, HFONT font, int id, const wchar_t* initial, int x, int y, int w, int h) {
     HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", initial,
                               WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                              x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+                              Px(x), Px(y), Px(w), Px(h), parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageW(e, WM_SETFONT, (WPARAM)font, TRUE);
     return e;
 }
 
 HWND MakeButton(HWND parent, HFONT font, int id, const wchar_t* text, int x, int y, int w, int h, DWORD extraStyle = 0) {
     HWND b = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | extraStyle,
-                              x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+                              Px(x), Px(y), Px(w), Px(h), parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageW(b, WM_SETFONT, (WPARAM)font, TRUE);
     return b;
 }
@@ -166,7 +174,9 @@ void OnToggleLimiter() {
 
     if (!ReadFieldsIntoConfig()) return;
     SaveConfig(g_app.configPath, g_app.cfg);
-    g_app.limiter = std::make_unique<Limiter>(g_app.cfg);
+    g_app.limiter = std::make_unique<Limiter>(g_app.cfg, [] {
+        PostMessageW(g_app.hwnd, WM_APP_LIMITER_FINISHED, 0, 0);
+    });
     g_app.limiter->Start();
     SetStartStopUi(true);
 }
@@ -176,20 +186,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE: {
         g_app.hwnd = hwnd;
 
-        HDC hdc = GetDC(hwnd);
-        int fontHeight = -MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72);
-        ReleaseDC(hwnd, hdc);
-        g_app.hFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_app.dpi = GetDpiForWindow(hwnd);
+        g_app.hFont = CreateFontW(-MulDiv(9, g_app.dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
         HFONT font = g_app.hFont;
 
-        HFONT titleFont = CreateFontW(-MulDiv(15, 96, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        g_app.hTitleFont = CreateFontW(-MulDiv(15, g_app.dpi, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
         HWND title = CreateWindowExW(0, L"STATIC", L"OW Loss Limiter", WS_CHILD | WS_VISIBLE,
-                                      16, 12, 300, 28, hwnd, nullptr, nullptr, nullptr);
-        SendMessageW(title, WM_SETFONT, (WPARAM)titleFont, TRUE);
+                                      Px(16), Px(12), Px(300), Px(28), hwnd, nullptr, nullptr, nullptr);
+        SendMessageW(title, WM_SETFONT, (WPARAM)g_app.hTitleFont, TRUE);
 
         int y = 54, rowH = 32, labelW = 140, editX = 164;
         SetLabel(hwnd, font, L"Loss Limit", 16, y, labelW, 20);
@@ -223,7 +231,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         y += 36;
 
         g_app.hStatusLabel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                              16, y, 560, 20, hwnd, nullptr, nullptr, nullptr);
+                                              Px(16), Px(y), Px(560), Px(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageW(g_app.hStatusLabel, WM_SETFONT, (WPARAM)font, TRUE);
         y += 28;
 
@@ -232,7 +240,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_app.hLogView = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                           WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
                                           ES_READONLY | ES_AUTOVSCROLL,
-                                          16, y, 574, 200, hwnd, (HMENU)(INT_PTR)ID_EDIT_LOG, nullptr, nullptr);
+                                          Px(16), Px(y), Px(574), Px(200), hwnd, (HMENU)(INT_PTR)ID_EDIT_LOG, nullptr, nullptr);
         SendMessageW(g_app.hLogView, WM_SETFONT, (WPARAM)font, TRUE);
 
         g_app.appDir = AppDirW();
@@ -254,6 +262,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         delete line;
         return 0;
     }
+    case WM_APP_LIMITER_FINISHED:
+        if (g_app.limiter) {
+            g_app.limiter->Stop();
+            g_app.limiter.reset();
+        }
+        SetStartStopUi(false);
+        return 0;
     case WM_TIMER:
         if (wParam == TIMER_STATUS_CLEAR) {
             SetWindowTextW(g_app.hStatusLabel, L"");
@@ -272,6 +287,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_app.limiter) g_app.limiter->Stop();
         Logger::Instance().SetSink(nullptr);
         if (g_app.hFont) DeleteObject(g_app.hFont);
+        if (g_app.hTitleFont) DeleteObject(g_app.hTitleFont);
         PostQuitMessage(0);
         return 0;
     }
@@ -296,8 +312,9 @@ int RunApp(HINSTANCE hInstance, int nCmdShow) {
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rect{0, 0, 624, 520};
-    AdjustWindowRect(&rect, style, FALSE);
+    UINT dpi = GetDpiForSystem();
+    RECT rect{0, 0, MulDiv(624, dpi, 96), MulDiv(520, dpi, 96)};
+    AdjustWindowRectExForDpi(&rect, style, FALSE, 0, dpi);
 
     HWND hwnd = CreateWindowExW(0, kClassName, L"OW Loss Limiter", style,
                                  CW_USEDEFAULT, CW_USEDEFAULT,

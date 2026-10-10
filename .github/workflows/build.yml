@@ -1,0 +1,27 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tesseract
+        run: choco install tesseract -y --no-progress
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Test
+        shell: cmd
+        run: tests\run_tests.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LossLimiter
+          path: LossLimiter.exe

@@ -4,10 +4,13 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 
 class Limiter {
 public:
-    explicit Limiter(Config cfg);
+    // onFinished runs on the worker thread when the limiter stops by itself
+    // (after closing the game). It is not called for Stop().
+    Limiter(Config cfg, std::function<void()> onFinished);
     ~Limiter();
 
     void Start();
@@ -19,6 +22,7 @@ private:
     bool InterruptibleWait(double seconds);
 
     Config cfg_;
+    std::function<void()> onFinished_;
     std::thread thread_;
     std::atomic<bool> running_{false};
 
