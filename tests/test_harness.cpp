@@ -1,13 +1,151 @@
+// Test runner for the parts of LossLimiter that can be checked without a game
+// running. Usage: test_harness.exe [path\to\tesseract.exe]
 #include "process_utils.h"
 #include "screen_capture.h"
 #include "ocr.h"
 #include "config.h"
+#include "loss_tracker.h"
 #include "strutil.h"
 #include <windows.h>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
 namespace {
+
+int g_failures = 0;
+int g_checks = 0;
+
+void Check(bool ok, const std::string& name, const std::string& detail = "") {
+    ++g_checks;
+    if (!ok) ++g_failures;
+    std::cout << (ok ? "  PASS  " : "  FAIL  ") << name;
+    if (!detail.empty()) std::cout << " (" << detail << ")";
+    std::cout << "\n";
+}
+
+using Event = LossTracker::Event;
+
+// Feeds the same detection for `seconds`, one poll per second, starting at t.
+// Returns the last non-None event, and advances t.
+Event Feed(LossTracker& tracker, Detection d, int seconds, double& t) {
+    Event last = Event::None;
+    for (int i = 0; i < seconds; ++i, t += 1.0) {
+        Event e = tracker.Update(d, t);
+        if (e != Event::None) last = e;
+    }
+    return last;
+}
+
+// One full match result: banner on screen for 6s, then back to gameplay.
+Event PlayMatch(LossTracker& tracker, Detection result, double& t) {
+    Event e = Feed(tracker, result, 6, t);
+    Event after = Feed(tracker, Detection::None, 10, t);
+    return e != Event::None ? e : after;
+}
+
+void TestLossTracker() {
+    std::cout << "LossTracker\n";
+    double t = 0;
+
+    {
+        LossTracker tr(3);
+        tr.Update(Detection::Defeat, t++);
+        Feed(tr, Detection::None, 20, t);
+        Check(tr.Losses() == 0, "a single DEFEAT frame is ignored (debounce)");
+    }
+    {
+        LossTracker tr(3);
+        for (int i = 0; i < 10; ++i) {
+            tr.Update(i % 2 ? Detection::Defeat : Detection::Victory, t++);
+        }
+        Feed(tr, Detection::None, 20, t);
+        Check(tr.Losses() == 0, "alternating DEFEAT/VICTORY never settles");
+    }
+    {
+        LossTracker tr(3);
+        Event e = PlayMatch(tr, Detection::Defeat, t);
+        Check(e == Event::Loss && tr.Losses() == 1, "a defeat counts once",
+              "losses=" + std::to_string(tr.Losses()));
+    }
+    {
+        LossTracker tr(3);
+        Feed(tr, Detection::Defeat, 30, t);
+        Check(tr.Losses() == 1, "a banner left up for 30s counts once",
+              "losses=" + std::to_string(tr.Losses()));
+    }
+    {
+        LossTracker tr(3);
+        PlayMatch(tr, Detection::Defeat, t);
+        PlayMatch(tr, Detection::Defeat, t);
+        Event e = PlayMatch(tr, Detection::Victory, t);
+        Check(e == Event::Win && tr.Losses() == 0, "a win resets the streak");
+    }
+    {
+        LossTracker tr(3);
+        Event a = PlayMatch(tr, Detection::Defeat, t);
+        Event b = PlayMatch(tr, Detection::Defeat, t);
+        Event c = PlayMatch(tr, Detection::Defeat, t);
+        Check(a == Event::Loss && b == Event::Loss && c == Event::LimitReached,
+              "third loss in a row reaches the limit of 3");
+    }
+    {
+        LossTracker tr(1);
+        Check(PlayMatch(tr, Detection::Defeat, t) == Event::LimitReached, "limit of 1 triggers on the first loss");
+    }
+}
+
+void TestConfig() {
+    std::cout << "Config\n";
+    auto dir = std::filesystem::temp_directory_path();
+    std::wstring path = (dir / L"losslimiter_test_config.txt").wstring();
+
+    Config missing = LoadConfig(path + L".does-not-exist");
+    Check(missing.losses == 3 && missing.process == "Overwatch.exe", "missing file gives defaults");
+
+    Config cfg;
+    cfg.losses = 5;
+    cfg.poll = 1.5;
+    cfg.process = "Game.exe";
+    cfg.tesseract_path = "D:\\Tools\\tesseract.exe";
+    cfg.debug = true;
+    SaveConfig(path, cfg);
+    Config back = LoadConfig(path);
+    Check(back.losses == 5 && back.poll == 1.5 && back.process == "Game.exe" &&
+          back.tesseract_path == cfg.tesseract_path && back.debug,
+          "save then load round-trips every field");
+
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    fputs("# comment\r\nlosses = abc\r\n  poll=0.5  \r\nnot a setting\r\ndebug=TRUE\r\n", f);
+    fclose(f);
+    Config messy = LoadConfig(path);
+    Check(messy.losses == 3 && messy.poll == 0.5 && messy.debug,
+          "bad values and junk lines are skipped, CRLF and spaces tolerated");
+
+    DeleteFileW(path.c_str());
+}
+
+void TestStrings() {
+    std::cout << "String helpers\n";
+    Check(Trim("  a b \r\n") == "a b", "Trim");
+    Check(EqualsIgnoreCase("Overwatch.exe", "OVERWATCH.EXE"), "EqualsIgnoreCase");
+    Check(ContainsIgnoreCase("xx\nDefeat\n", "DEFEAT"), "ContainsIgnoreCase");
+    Check(WideToUtf8(Utf8ToWide("caf\xC3\xA9")) == "caf\xC3\xA9", "UTF-8 round trip");
+}
+
+void TestProcessLookup() {
+    std::cout << "Process lookup\n";
+    char self[MAX_PATH];
+    GetModuleFileNameA(nullptr, self, MAX_PATH);
+    std::string selfName = std::filesystem::path(self).filename().string();
+
+    Check(FindProcessId(selfName) == GetCurrentProcessId(), "finds its own process", selfName);
+    Check(FindProcessId("NoSuchProcess12345.exe") == 0, "unknown process returns 0");
+
+    std::string upper = selfName;
+    for (char& c : upper) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+    Check(FindProcessId(upper) != 0, "lookup is case-insensitive");
+}
 
 CapturedImage RenderTextImage(const wchar_t* text) {
     int w = 400, h = 120;
@@ -63,29 +201,8 @@ const char* Name(Detection d) {
     }
 }
 
-}
-
-int main() {
-    int failures = 0;
-
-    std::cout << "[Test 1] FindProcessId(\"explorer.exe\")... ";
-    DWORD pid = FindProcessId("explorer.exe");
-    std::cout << (pid != 0 ? "PASS" : "FAIL") << " (pid=" << pid << ")\n";
-    if (pid == 0) failures++;
-
-    std::cout << "[Test 2] FindProcessId(\"NoSuchProcess12345.exe\")... ";
-    DWORD missing = FindProcessId("NoSuchProcess12345.exe");
-    std::cout << (missing == 0 ? "PASS" : "FAIL") << "\n";
-    if (missing != 0) failures++;
-
-    std::cout << "[Test 3] Case-insensitive match FindProcessId(\"EXPLORER.EXE\")... ";
-    DWORD pidCi = FindProcessId("EXPLORER.EXE");
-    std::cout << (pidCi != 0 ? "PASS" : "FAIL") << "\n";
-    if (pidCi == 0) failures++;
-
-    Config cfg;
-    std::wstring tesseractExe = ResolveTesseractPath(cfg);
-    std::wcout << L"Using tesseract at: " << tesseractExe << L"\n";
+void TestOcr(const std::wstring& tesseractExe) {
+    std::cout << "OCR (tesseract: " << WideToUtf8(tesseractExe) << ")\n";
 
     struct Case { const wchar_t* text; Detection expected; };
     Case cases[] = {
@@ -94,19 +211,27 @@ int main() {
         {L"asdf qwer", Detection::None},
     };
 
-    int n = 4;
     for (auto& c : cases) {
-        CapturedImage img = RenderTextImage(c.text);
         std::string error;
-        Detection got = RunOcr(img, tesseractExe, error);
-        bool pass = got == c.expected;
-        std::wcout << L"[Test " << n++ << L"] OCR rendered \"" << c.text << L"\" -> "
-                    << Name(got) << (pass ? L" PASS" : L" FAIL");
-        if (!error.empty()) std::wcout << L" (error: " << Utf8ToWide(error) << L")";
-        std::wcout << L"\n";
-        if (!pass) failures++;
+        Detection got = RunOcr(RenderTextImage(c.text), tesseractExe, error);
+        std::string detail = std::string("got ") + Name(got);
+        if (!error.empty()) detail += ", error: " + error;
+        Check(got == c.expected && error.empty(), "reads \"" + WideToUtf8(c.text) + "\"", detail);
     }
+}
 
-    std::cout << "\n" << (failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED") << " (" << failures << " failures)\n";
-    return failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    TestLossTracker();
+    TestConfig();
+    TestStrings();
+    TestProcessLookup();
+
+    Config cfg;
+    if (argc > 1) cfg.tesseract_path = argv[1];
+    TestOcr(ResolveTesseractPath(cfg));
+
+    std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks << " checks passed\n";
+    return g_failures == 0 ? 0 : 1;
 }
